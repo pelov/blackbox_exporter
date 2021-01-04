@@ -252,4 +252,7 @@ validate_additional_rrs:
 # Used to verify the hostname for the targets.
 [ server_name: <string> ]
 
+# Renegotiation support
+[ renegotiation: <string> | default = "never" ] # never, once, freely
+
 ```
