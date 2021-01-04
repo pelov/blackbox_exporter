@@ -129,6 +129,7 @@ type HTTPProbe struct {
 	ValidHTTPVersions            []string                `yaml:"valid_http_versions,omitempty"`
 	IPProtocol                   string                  `yaml:"preferred_ip_protocol,omitempty"`
 	IPProtocolFallback           bool                    `yaml:"ip_protocol_fallback,omitempty"`
+	HTTPVersion                  string                  `yaml:"http_version,omitempty"`
 	NoFollowRedirects            bool                    `yaml:"no_follow_redirects,omitempty"`
 	FailIfSSL                    bool                    `yaml:"fail_if_ssl,omitempty"`
 	FailIfNotSSL                 bool                    `yaml:"fail_if_not_ssl,omitempty"`
@@ -223,6 +224,10 @@ func (s *HTTPProbe) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err := s.HTTPClientConfig.Validate(); err != nil {
 		return err
 	}
+	if s.HTTPVersion != "" && s.HTTPVersion != "1.1" && s.HTTPVersion != "2.0" {
+		return fmt.Errorf("invalid http_version '%s'", s.HTTPVersion)
+	}
+
 	return nil
 }
 

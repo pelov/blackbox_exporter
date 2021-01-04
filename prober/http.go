@@ -352,14 +352,20 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		// the hostname of the target.
 		httpClientConfig.TLSConfig.ServerName = targetHost
 	}
-	client, err := pconfig.NewClientFromConfig(httpClientConfig, "http_probe", true)
+
+	enableHTTP2 := true
+	if httpConfig.HTTPVersion == "1.1" {
+		enableHTTP2 = false
+	}
+
+	client, err := pconfig.NewClientFromConfig(httpClientConfig, "http_probe", true, enableHTTP2)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error generating HTTP client", "err", err)
 		return false
 	}
 
 	httpClientConfig.TLSConfig.ServerName = ""
-	noServerName, err := pconfig.NewRoundTripperFromConfig(httpClientConfig, "http_probe", true)
+	noServerName, err := pconfig.NewRoundTripperFromConfig(httpClientConfig, "http_probe", true, enableHTTP2)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error generating HTTP client without ServerName", "err", err)
 		return false

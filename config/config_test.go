@@ -48,6 +48,10 @@ func TestLoadBadConfigs(t *testing.T) {
 			ExpectedError: "error parsing config file: at most one of bearer_token & bearer_token_file must be configured",
 		},
 		{
+			ConfigFile:    "testdata/invalid-http-version.yml",
+			ExpectedError: "error parsing config file: invalid http_version '1.2'",
+		},
+		{
 			ConfigFile:    "testdata/invalid-dns-module.yml",
 			ExpectedError: "error parsing config file: query name must be set for DNS module",
 		},
