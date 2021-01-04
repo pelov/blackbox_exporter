@@ -45,6 +45,9 @@ The other placeholders are specified separately.
   # The HTTP method the probe will use.
   [ method: <string> | default = "GET" ]
 
+  # The HTTP protocol version to use.
+  [ http_version: <string> | default = "2.0" ]
+
   # The HTTP headers set for the probe.
   headers:
     [ <string>: <string> ... ]
