@@ -6,6 +6,7 @@ HTTP, HTTPS, DNS, TCP and ICMP.
 This build is based on a fork [pelov/common](https://github.com/pelov/common) of [prometheus/common](https://github.com/prometheus/common) supporting the following additional patches:
 * [Support TLS renegotiation](https://github.com/prometheus/common/pull/221) for the http prober
 * [Fall back on environment http proxies](https://github.com/prometheus/common/pull/94)
+* [Support http.http_version configuration](https://github.com/pelov/blackbox_exporter/tree/http_version)
 
 
 ## Running this software
