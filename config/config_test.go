@@ -25,7 +25,7 @@ func TestLoadConfig(t *testing.T) {
 		C: &Config{},
 	}
 
-	err := sc.ReloadConfig("testdata/blackbox-good.yml")
+	err := sc.ReloadConfig("testdata/blackbox-good.yml", nil)
 	if err != nil {
 		t.Errorf("Error loading config %v: %v", "blackbox.yml", err)
 	}
@@ -36,47 +36,69 @@ func TestLoadBadConfigs(t *testing.T) {
 		C: &Config{},
 	}
 	tests := []struct {
-		ConfigFile    string
-		ExpectedError string
+		input string
+		want  string
 	}{
 		{
-			ConfigFile:    "testdata/blackbox-bad.yml",
-			ExpectedError: "error parsing config file: yaml: unmarshal errors:\n  line 50: field invalid_extra_field not found in type config.plain",
+			input: "testdata/blackbox-bad.yml",
+			want:  "error parsing config file: yaml: unmarshal errors:\n  line 50: field invalid_extra_field not found in type config.plain",
 		},
 		{
-			ConfigFile:    "testdata/blackbox-bad2.yml",
-			ExpectedError: "error parsing config file: at most one of bearer_token & bearer_token_file must be configured",
+			input: "testdata/blackbox-bad2.yml",
+			want:  "error parsing config file: at most one of bearer_token & bearer_token_file must be configured",
 		},
 		{
-			ConfigFile:    "testdata/invalid-http-version.yml",
-			ExpectedError: "error parsing config file: invalid http_version '1.2'",
+			input: "testdata/invalid-http-version.yml",
+			want:  "error parsing config file: invalid http_version '1.2'",
 		},
 		{
-			ConfigFile:    "testdata/invalid-dns-module.yml",
-			ExpectedError: "error parsing config file: query name must be set for DNS module",
+			input: "testdata/invalid-dns-module.yml",
+			want:  "error parsing config file: query name must be set for DNS module",
 		},
 		{
-			ConfigFile:    "testdata/invalid-dns-class.yml",
-			ExpectedError: "error parsing config file: query class 'X' is not valid",
+			input: "testdata/invalid-dns-class.yml",
+			want:  "error parsing config file: query class 'X' is not valid",
 		},
 		{
-			ConfigFile:    "testdata/invalid-dns-type.yml",
-			ExpectedError: "error parsing config file: query type 'X' is not valid",
+			input: "testdata/invalid-dns-type.yml",
+			want:  "error parsing config file: query type 'X' is not valid",
 		},
 		{
-			ConfigFile:    "testdata/invalid-http-header-match.yml",
-			ExpectedError: "error parsing config file: regexp must be set for HTTP header matchers",
+			input: "testdata/invalid-http-header-match.yml",
+			want:  "error parsing config file: regexp must be set for HTTP header matchers",
+		},
+		{
+			input: "testdata/invalid-http-body-match-regexp.yml",
+			want:  `error parsing config file: "Could not compile regular expression" regexp=":["`,
+		},
+		{
+			input: "testdata/invalid-http-body-not-match-regexp.yml",
+			want:  `error parsing config file: "Could not compile regular expression" regexp=":["`,
+		},
+		{
+			input: "testdata/invalid-http-header-match-regexp.yml",
+			want:  `error parsing config file: "Could not compile regular expression" regexp=":["`,
+		},
+		{
+			input: "testdata/invalid-http-compression-mismatch.yml",
+			want:  `error parsing config file: invalid configuration "Accept-Encoding: deflate", "compression: gzip"`,
+		},
+		{
+			input: "testdata/invalid-http-request-compression-reject-all-encodings.yml",
+			want:  `error parsing config file: invalid configuration "Accept-Encoding: *;q=0.0", "compression: gzip"`,
+		},
+		{
+			input: "testdata/invalid-tcp-query-response-regexp.yml",
+			want:  `error parsing config file: "Could not compile regular expression" regexp=":["`,
 		},
 	}
-	for i, test := range tests {
-		err := sc.ReloadConfig(test.ConfigFile)
-		if err == nil {
-			t.Errorf("In case %v:\nExpected:\n%v\nGot:\nnil", i, test.ExpectedError)
-			continue
-		}
-		if err.Error() != test.ExpectedError {
-			t.Errorf("In case %v:\nExpected:\n%v\nGot:\n%v", i, test.ExpectedError, err.Error())
-		}
+	for _, test := range tests {
+		t.Run(test.input, func(t *testing.T) {
+			got := sc.ReloadConfig(test.input, nil)
+			if got == nil || got.Error() != test.want {
+				t.Fatalf("ReloadConfig(%q) = %v; want %q", test.input, got, test.want)
+			}
+		})
 	}
 }
 
@@ -85,7 +107,7 @@ func TestHideConfigSecrets(t *testing.T) {
 		C: &Config{},
 	}
 
-	err := sc.ReloadConfig("testdata/blackbox-good.yml")
+	err := sc.ReloadConfig("testdata/blackbox-good.yml", nil)
 	if err != nil {
 		t.Errorf("Error loading config %v: %v", "testdata/blackbox-good.yml", err)
 	}
@@ -99,5 +121,88 @@ func TestHideConfigSecrets(t *testing.T) {
 	}
 	if strings.Contains(string(c), "mysecret") {
 		t.Fatal("config's String method reveals authentication credentials.")
+	}
+}
+
+func TestIsEncodingAcceptable(t *testing.T) {
+	testcases := map[string]struct {
+		input          string
+		acceptEncoding string
+		expected       bool
+	}{
+		"empty compression": {
+			input:          "",
+			acceptEncoding: "gzip",
+			expected:       true,
+		},
+		"trivial": {
+			input:          "gzip",
+			acceptEncoding: "gzip",
+			expected:       true,
+		},
+		"trivial, quality": {
+			input:          "gzip",
+			acceptEncoding: "gzip;q=1.0",
+			expected:       true,
+		},
+		"first": {
+			input:          "gzip",
+			acceptEncoding: "gzip, compress",
+			expected:       true,
+		},
+		"second": {
+			input:          "gzip",
+			acceptEncoding: "compress, gzip",
+			expected:       true,
+		},
+		"missing": {
+			input:          "br",
+			acceptEncoding: "gzip, compress",
+			expected:       false,
+		},
+		"*": {
+			input:          "br",
+			acceptEncoding: "gzip, compress, *",
+			expected:       true,
+		},
+		"* with quality": {
+			input:          "br",
+			acceptEncoding: "gzip, compress, *;q=0.1",
+			expected:       true,
+		},
+		"rejected": {
+			input:          "br",
+			acceptEncoding: "gzip, compress, br;q=0.0",
+			expected:       false,
+		},
+		"rejected *": {
+			input:          "br",
+			acceptEncoding: "gzip, compress, *;q=0.0",
+			expected:       false,
+		},
+		"complex": {
+			input:          "br",
+			acceptEncoding: "gzip;q=1.0, compress;q=0.5, br;q=0.1, *;q=0.0",
+			expected:       true,
+		},
+		"complex out of order": {
+			input:          "br",
+			acceptEncoding: "*;q=0.0, compress;q=0.5, br;q=0.1, gzip;q=1.0",
+			expected:       true,
+		},
+		"complex with extra blanks": {
+			input:          "br",
+			acceptEncoding: " gzip;q=1.0, compress; q=0.5, br;q=0.1, *; q=0.0 ",
+			expected:       true,
+		},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			actual := isCompressionAcceptEncodingValid(tc.input, tc.acceptEncoding)
+			if actual != tc.expected {
+				t.Errorf("Unexpected result: input=%q acceptEncoding=%q expected=%t actual=%t", tc.input, tc.acceptEncoding, tc.expected, actual)
+			}
+		})
 	}
 }

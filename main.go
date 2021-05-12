@@ -39,6 +39,8 @@ import (
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
+	"github.com/prometheus/exporter-toolkit/web"
+	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"gopkg.in/yaml.v3"
 
@@ -52,6 +54,7 @@ var (
 	}
 
 	configFile    = kingpin.Flag("config.file", "Blackbox exporter configuration file.").Default("blackbox.yml").String()
+	webConfig     = webflag.AddFlags(kingpin.CommandLine)
 	listenAddress = kingpin.Flag("web.listen-address", "The address to listen on for HTTP requests.").Default(":9115").String()
 	timeoutOffset = kingpin.Flag("timeout-offset", "Offset to subtract from timeout in seconds.").Default("0.5").Float64()
 	configCheck   = kingpin.Flag("config.check", "If true validate the config file and then exit.").Default().Bool()
@@ -221,7 +224,7 @@ func run() int {
 	level.Info(logger).Log("msg", "Starting blackbox_exporter", "version", version.Info())
 	level.Info(logger).Log("build_context", version.BuildContext())
 
-	if err := sc.ReloadConfig(*configFile); err != nil {
+	if err := sc.ReloadConfig(*configFile, logger); err != nil {
 		level.Error(logger).Log("msg", "Error loading config", "err", err)
 		return 1
 	}
@@ -262,13 +265,13 @@ func run() int {
 		for {
 			select {
 			case <-hup:
-				if err := sc.ReloadConfig(*configFile); err != nil {
+				if err := sc.ReloadConfig(*configFile, logger); err != nil {
 					level.Error(logger).Log("msg", "Error reloading config", "err", err)
 					continue
 				}
 				level.Info(logger).Log("msg", "Reloaded config file")
 			case rc := <-reloadCh:
-				if err := sc.ReloadConfig(*configFile); err != nil {
+				if err := sc.ReloadConfig(*configFile, logger); err != nil {
 					level.Error(logger).Log("msg", "Error reloading config", "err", err)
 					rc <- err
 				} else {
@@ -306,6 +309,10 @@ func run() int {
 			}
 		})
 	http.Handle(path.Join(*routePrefix, "/metrics"), promhttp.Handler())
+	http.HandleFunc(path.Join(*routePrefix, "/-/healthy"), func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Healthy"))
+	})
 	http.HandleFunc(path.Join(*routePrefix, "/probe"), func(w http.ResponseWriter, r *http.Request) {
 		sc.Lock()
 		conf := sc.C
@@ -369,14 +376,14 @@ func run() int {
 		w.Write(c)
 	})
 
-	srv := http.Server{Addr: *listenAddress}
+	srv := &http.Server{Addr: *listenAddress}
 	srvc := make(chan struct{})
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		if err := web.ListenAndServe(srv, *webConfig, logger); err != http.ErrServerClosed {
 			level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
 			close(srvc)
 		}

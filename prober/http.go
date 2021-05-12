@@ -14,7 +14,10 @@
 package prober
 
 import (
+	"compress/flate"
+	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -25,12 +28,12 @@ import (
 	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
@@ -47,23 +50,13 @@ func matchRegularExpressions(reader io.Reader, httpConfig config.HTTPProbe, logg
 		return false
 	}
 	for _, expression := range httpConfig.FailIfBodyMatchesRegexp {
-		re, err := regexp.Compile(expression)
-		if err != nil {
-			level.Error(logger).Log("msg", "Could not compile regular expression", "regexp", expression, "err", err)
-			return false
-		}
-		if re.Match(body) {
+		if expression.Regexp.Match(body) {
 			level.Error(logger).Log("msg", "Body matched regular expression", "regexp", expression)
 			return false
 		}
 	}
 	for _, expression := range httpConfig.FailIfBodyNotMatchesRegexp {
-		re, err := regexp.Compile(expression)
-		if err != nil {
-			level.Error(logger).Log("msg", "Could not compile regular expression", "regexp", expression, "err", err)
-			return false
-		}
-		if !re.Match(body) {
+		if !expression.Regexp.Match(body) {
 			level.Error(logger).Log("msg", "Body did not match regular expression", "regexp", expression)
 			return false
 		}
@@ -83,14 +76,8 @@ func matchRegularExpressionsOnHeaders(header http.Header, httpConfig config.HTTP
 			}
 		}
 
-		re, err := regexp.Compile(headerMatchSpec.Regexp)
-		if err != nil {
-			level.Error(logger).Log("msg", "Could not compile regular expression", "regexp", headerMatchSpec.Regexp, "err", err)
-			return false
-		}
-
 		for _, val := range values {
-			if re.MatchString(val) {
+			if headerMatchSpec.Regexp.MatchString(val) {
 				level.Error(logger).Log("msg", "Header matched regular expression", "header", headerMatchSpec.Header,
 					"regexp", headerMatchSpec.Regexp, "value_count", len(values))
 				return false
@@ -108,16 +95,10 @@ func matchRegularExpressionsOnHeaders(header http.Header, httpConfig config.HTTP
 			}
 		}
 
-		re, err := regexp.Compile(headerMatchSpec.Regexp)
-		if err != nil {
-			level.Error(logger).Log("msg", "Could not compile regular expression", "regexp", headerMatchSpec.Regexp, "err", err)
-			return false
-		}
-
 		anyHeaderValueMatched := false
 
 		for _, val := range values {
-			if re.MatchString(val) {
+			if headerMatchSpec.Regexp.MatchString(val) {
 				anyHeaderValueMatched = true
 				break
 			}
@@ -142,6 +123,8 @@ type roundTripTrace struct {
 	gotConn       time.Time
 	responseStart time.Time
 	end           time.Time
+	tlsStart      time.Time
+	tlsDone       time.Time
 }
 
 // transport is a custom transport keeping traces for each HTTP roundtrip.
@@ -224,6 +207,16 @@ func (t *transport) GotFirstResponseByte() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.current.responseStart = time.Now()
+}
+func (t *transport) TLSHandshakeStart() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.current.tlsStart = time.Now()
+}
+func (t *transport) TLSHandshakeDone(_ tls.ConnectionState, _ error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.current.tlsDone = time.Now()
 }
 
 // byteCounter implements an io.ReadCloser that keeps track of the total
@@ -353,19 +346,20 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		httpClientConfig.TLSConfig.ServerName = targetHost
 	}
 
-	enableHTTP2 := true
+	clientOpts := []pconfig.HTTPClientOption{pconfig.WithKeepAlivesDisabled()}
 	if httpConfig.HTTPVersion == "1.1" {
-		enableHTTP2 = false
+		clientOpts = append(clientOpts, pconfig.WithHTTP2Disabled())
 	}
 
-	client, err := pconfig.NewClientFromConfig(httpClientConfig, "http_probe", true, enableHTTP2)
+	client, err := pconfig.NewClientFromConfig(httpClientConfig, "http_probe", clientOpts...)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error generating HTTP client", "err", err)
 		return false
 	}
 
 	httpClientConfig.TLSConfig.ServerName = ""
-	noServerName, err := pconfig.NewRoundTripperFromConfig(httpClientConfig, "http_probe", true, enableHTTP2)
+
+	noServerName, err := pconfig.NewRoundTripperFromConfig(httpClientConfig, "http_probe", clientOpts...)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error generating HTTP client without ServerName", "err", err)
 		return false
@@ -386,7 +380,7 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 	client.CheckRedirect = func(r *http.Request, via []*http.Request) error {
 		level.Info(logger).Log("msg", "Received redirect", "location", r.Response.Header.Get("Location"))
 		redirects = len(via)
-		if redirects > 10 || httpConfig.NoFollowRedirects {
+		if redirects > 10 || !httpConfig.HTTPClientConfig.FollowRedirects {
 			level.Info(logger).Log("msg", "Not following redirect")
 			return errors.New("don't follow redirects")
 		}
@@ -430,6 +424,7 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			request.Host = value
 			continue
 		}
+
 		request.Header.Set(key, value)
 	}
 
@@ -440,13 +435,22 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		ConnectDone:          tt.ConnectDone,
 		GotConn:              tt.GotConn,
 		GotFirstResponseByte: tt.GotFirstResponseByte,
+		TLSHandshakeStart:    tt.TLSHandshakeStart,
+		TLSHandshakeDone:     tt.TLSHandshakeDone,
 	}
 	request = request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
 
 	resp, err := client.Do(request)
-	// Err won't be nil if redirects were turned off. See https://github.com/golang/go/issues/3795
-	if err != nil && resp == nil {
-		level.Error(logger).Log("msg", "Error for HTTP request", "err", err)
+	// This is different from the usual err != nil you'd expect here because err won't be nil if redirects were
+	// turned off. See https://github.com/golang/go/issues/3795
+	//
+	// If err == nil there should never be a case where resp is also nil, but better be safe than sorry, so check if
+	// resp == nil first, and then check if there was an error.
+	if resp == nil {
+		resp = &http.Response{}
+		if err != nil {
+			level.Error(logger).Log("msg", "Error for HTTP request", "err", err)
+		}
 	} else {
 		requestErrored := (err != nil)
 
@@ -477,6 +481,31 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			}
 		}
 
+		// Since the configuration specifies a compression algorithm, blindly treat the response body as a
+		// compressed payload; if we cannot decompress it it's a failure because the configuration says we
+		// should expect the response to be compressed in that way.
+		if httpConfig.Compression != "" {
+			dec, err := getDecompressionReader(httpConfig.Compression, resp.Body)
+			if err != nil {
+				level.Info(logger).Log("msg", "Failed to get decompressor for HTTP response body", "err", err)
+				success = false
+			} else if dec != nil {
+				// Since we are replacing the original resp.Body with the decoder, we need to make sure
+				// we close the original body. We cannot close it right away because the decompressor
+				// might not have read it yet.
+				defer func(c io.Closer) {
+					err := c.Close()
+					if err != nil {
+						// At this point we cannot really do anything with this error, but log
+						// it in case it contains useful information as to what's the problem.
+						level.Info(logger).Log("msg", "Error while closing response from server", "err", err)
+					}
+				}(resp.Body)
+
+				resp.Body = dec
+			}
+		}
+
 		byteCounter := &byteCounter{ReadCloser: resp.Body}
 
 		if success && (len(httpConfig.FailIfBodyMatchesRegexp) > 0 || len(httpConfig.FailIfBodyNotMatchesRegexp) > 0) {
@@ -488,7 +517,7 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			}
 		}
 
-		if resp != nil && !requestErrored {
+		if !requestErrored {
 			_, err = io.Copy(ioutil.Discard, byteCounter)
 			if err != nil {
 				level.Info(logger).Log("msg", "Failed to read HTTP response body", "err", err)
@@ -498,8 +527,9 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			respBodyBytes = byteCounter.n
 
 			if err := byteCounter.Close(); err != nil {
-				// We have already read everything we could from the server. The error here might be a
-				// TCP error. Log it in case it contains useful information as to what's the problem.
+				// We have already read everything we could from the server, maybe even uncompressed the
+				// body. The error here might be either a decompression error or a TCP error. Log it in
+				// case it contains useful information as to what's the problem.
 				level.Info(logger).Log("msg", "Error while closing response from server", "error", err.Error())
 			}
 		}
@@ -533,12 +563,8 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 				success = false
 			}
 		}
-
 	}
 
-	if resp == nil {
-		resp = &http.Response{}
-	}
 	tt.mu.Lock()
 	defer tt.mu.Unlock()
 	for i, trace := range tt.traces {
@@ -550,6 +576,8 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			"connectDone", trace.connectDone,
 			"gotConn", trace.gotConn,
 			"responseStart", trace.responseStart,
+			"tlsStart", trace.tlsStart,
+			"tlsDone", trace.tlsDone,
 			"end", trace.end,
 		)
 		// We get the duration for the first request from chooseProtocol.
@@ -563,7 +591,7 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		if trace.tls {
 			// dnsDone must be set if gotConn was set.
 			durationGaugeVec.WithLabelValues("connect").Add(trace.connectDone.Sub(trace.dnsDone).Seconds())
-			durationGaugeVec.WithLabelValues("tls").Add(trace.gotConn.Sub(trace.dnsDone).Seconds())
+			durationGaugeVec.WithLabelValues("tls").Add(trace.tlsDone.Sub(trace.tlsStart).Seconds())
 		} else {
 			durationGaugeVec.WithLabelValues("connect").Add(trace.gotConn.Sub(trace.dnsDone).Seconds())
 		}
@@ -603,4 +631,23 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 	bodyUncompressedLengthGauge.Set(float64(respBodyBytes))
 	redirectsGauge.Set(float64(redirects))
 	return
+}
+
+func getDecompressionReader(algorithm string, origBody io.ReadCloser) (io.ReadCloser, error) {
+	switch strings.ToLower(algorithm) {
+	case "br":
+		return ioutil.NopCloser(brotli.NewReader(origBody)), nil
+
+	case "deflate":
+		return flate.NewReader(origBody), nil
+
+	case "gzip":
+		return gzip.NewReader(origBody)
+
+	case "identity", "":
+		return origBody, nil
+
+	default:
+		return nil, errors.New("unsupported compression algorithm")
+	}
 }

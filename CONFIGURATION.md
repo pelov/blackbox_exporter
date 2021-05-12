@@ -52,8 +52,20 @@ The other placeholders are specified separately.
   headers:
     [ <string>: <string> ... ]
 
+  # The compression algorithm to use to decompress the response (gzip, br, deflate, identity).
+  #
+  # If an "Accept-Encoding" header is specified, it MUST be such that the compression algorithm
+  # indicated using this option is acceptable. For example, you can use `compression: gzip` and
+  # `Accept-Encoding: br, gzip` or `Accept-Encoding: br;q=1.0, gzip;q=0.9`. The fact that gzip is
+  # acceptable with a lower quality than br does not invalidate the configuration, as you might
+  # be testing that the server does not return br-encoded content even if it's requested. On the
+  # other hand, `compression: gzip` and `Accept-Encoding: br, identity` is NOT a valid
+  # configuration, because you are asking for gzip to NOT be returned, and trying to decompress
+  # whatever the server returns is likely going to fail.
+  [ compression: <string> | default = "" ]
+
   # Whether or not the probe will follow any redirects.
-  [ no_follow_redirects: <boolean> | default = false ]
+  [ follow_redirects: <boolean> | default = true ]
 
   # Probe fails if SSL is present.
   [ fail_if_ssl: <boolean> | default = false ]
@@ -95,6 +107,10 @@ The other placeholders are specified separately.
 
   # HTTP proxy server to use to connect to the targets.
   [ proxy_url: <string> ]
+
+  # OAuth 2.0 configuration to use to connect to the targets.
+  oauth2:
+      [ <oauth2> ]
 
   # The IP protocol of the HTTP probe (ip4, ip6).
   [ preferred_ip_protocol: <string> | default = "ip6" ]
@@ -258,4 +274,33 @@ validate_additional_rrs:
 # Renegotiation support
 [ renegotiation: <string> | default = "never" ] # never, once, freely
 
+```
+
+#### <oauth2>
+
+OAuth 2.0 authentication using the client credentials grant type. Blackbox
+exporter fetches an access token from the specified endpoint with the given
+client access and secret keys.
+
+NOTE: This is *experimental* in the blackbox exporter and might not be
+reflected properly in the probe metrics at the moment.
+
+```yml
+client_id: <string>
+[ client_secret: <secret> ]
+
+# Read the client secret from a file.
+# It is mutually exclusive with `client_secret`.
+[ client_secret_file: <filename> ]
+
+# Scopes for the token request.
+scopes:
+  [ - <string> ... ]
+
+# The URL to fetch the token from.
+token_url: <string>
+
+# Optional parameters to append to the token URL.
+endpoint_params:
+  [ <string>: <string> ... ]
 ```

@@ -16,13 +16,20 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	yaml "gopkg.in/yaml.v3"
 
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/config"
@@ -52,6 +59,7 @@ var (
 	// DefaultHTTPProbe set default value for HTTPProbe
 	DefaultHTTPProbe = HTTPProbe{
 		IPProtocolFallback: true,
+		HTTPClientConfig:   config.DefaultHTTPClientConfig,
 	}
 
 	// DefaultTCPProbe set default value for TCPProbe
@@ -84,7 +92,7 @@ type SafeConfig struct {
 	C *Config
 }
 
-func (sc *SafeConfig) ReloadConfig(confFile string) (err error) {
+func (sc *SafeConfig) ReloadConfig(confFile string, logger log.Logger) (err error) {
 	var c = &Config{}
 	defer func() {
 		if err != nil {
@@ -107,11 +115,69 @@ func (sc *SafeConfig) ReloadConfig(confFile string) (err error) {
 		return fmt.Errorf("error parsing config file: %s", err)
 	}
 
+	for name, module := range c.Modules {
+		if module.HTTP.NoFollowRedirects != nil {
+			// Hide the old flag from the /config page.
+			module.HTTP.NoFollowRedirects = nil
+			c.Modules[name] = module
+			if logger != nil {
+				level.Warn(logger).Log("msg", "no_follow_redirects is deprecated and will be removed in the next release. It is replaced by follow_redirects.", "module", name)
+			}
+		}
+	}
+
 	sc.Lock()
 	sc.C = c
 	sc.Unlock()
 
 	return nil
+}
+
+// Regexp encapsulates a regexp.Regexp and makes it YAML marshalable.
+type Regexp struct {
+	*regexp.Regexp
+	original string
+}
+
+// NewRegexp creates a new anchored Regexp and returns an error if the
+// passed-in regular expression does not compile.
+func NewRegexp(s string) (Regexp, error) {
+	regex, err := regexp.Compile(s)
+	return Regexp{
+		Regexp:   regex,
+		original: s,
+	}, err
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (re *Regexp) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	r, err := NewRegexp(s)
+	if err != nil {
+		return fmt.Errorf("\"Could not compile regular expression\" regexp=\"%s\"", s)
+	}
+	*re = r
+	return nil
+}
+
+// MarshalYAML implements the yaml.Marshaler interface.
+func (re Regexp) MarshalYAML() (interface{}, error) {
+	if re.original != "" {
+		return re.original, nil
+	}
+	return nil, nil
+}
+
+// MustNewRegexp works like NewRegexp, but panics if the regular expression does not compile.
+func MustNewRegexp(s string) Regexp {
+	re, err := NewRegexp(s)
+	if err != nil {
+		panic(err)
+	}
+	return re
 }
 
 type Module struct {
@@ -130,27 +196,28 @@ type HTTPProbe struct {
 	IPProtocol                   string                  `yaml:"preferred_ip_protocol,omitempty"`
 	IPProtocolFallback           bool                    `yaml:"ip_protocol_fallback,omitempty"`
 	HTTPVersion                  string                  `yaml:"http_version,omitempty"`
-	NoFollowRedirects            bool                    `yaml:"no_follow_redirects,omitempty"`
+	NoFollowRedirects            *bool                   `yaml:"no_follow_redirects,omitempty"`
 	FailIfSSL                    bool                    `yaml:"fail_if_ssl,omitempty"`
 	FailIfNotSSL                 bool                    `yaml:"fail_if_not_ssl,omitempty"`
 	Method                       string                  `yaml:"method,omitempty"`
 	Headers                      map[string]string       `yaml:"headers,omitempty"`
-	FailIfBodyMatchesRegexp      []string                `yaml:"fail_if_body_matches_regexp,omitempty"`
-	FailIfBodyNotMatchesRegexp   []string                `yaml:"fail_if_body_not_matches_regexp,omitempty"`
+	FailIfBodyMatchesRegexp      []Regexp                `yaml:"fail_if_body_matches_regexp,omitempty"`
+	FailIfBodyNotMatchesRegexp   []Regexp                `yaml:"fail_if_body_not_matches_regexp,omitempty"`
 	FailIfHeaderMatchesRegexp    []HeaderMatch           `yaml:"fail_if_header_matches,omitempty"`
 	FailIfHeaderNotMatchesRegexp []HeaderMatch           `yaml:"fail_if_header_not_matches,omitempty"`
 	Body                         string                  `yaml:"body,omitempty"`
 	HTTPClientConfig             config.HTTPClientConfig `yaml:"http_client_config,inline"`
+	Compression                  string                  `yaml:"compression,omitempty"`
 }
 
 type HeaderMatch struct {
 	Header       string `yaml:"header,omitempty"`
-	Regexp       string `yaml:"regexp,omitempty"`
+	Regexp       Regexp `yaml:"regexp,omitempty"`
 	AllowMissing bool   `yaml:"allow_missing,omitempty"`
 }
 
 type QueryResponse struct {
-	Expect   string `yaml:"expect,omitempty"`
+	Expect   Regexp `yaml:"expect,omitempty"`
 	Send     string `yaml:"send,omitempty"`
 	StartTLS bool   `yaml:"starttls,omitempty"`
 }
@@ -227,6 +294,18 @@ func (s *HTTPProbe) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if s.HTTPVersion != "" && s.HTTPVersion != "1.1" && s.HTTPVersion != "2.0" {
 		return fmt.Errorf("invalid http_version '%s'", s.HTTPVersion)
 	}
+	if s.NoFollowRedirects != nil {
+		s.HTTPClientConfig.FollowRedirects = !*s.NoFollowRedirects
+	}
+
+	for key, value := range s.Headers {
+		switch strings.Title(key) {
+		case "Accept-Encoding":
+			if !isCompressionAcceptEncodingValid(s.Compression, value) {
+				return fmt.Errorf(`invalid configuration "%s: %s", "compression: %s"`, key, value, s.Compression)
+			}
+		}
+	}
 
 	return nil
 }
@@ -294,6 +373,7 @@ func (s *QueryResponse) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err := unmarshal((*plain)(s)); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -308,9 +388,76 @@ func (s *HeaderMatch) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return errors.New("header name must be set for HTTP header matchers")
 	}
 
-	if s.Regexp == "" {
+	if s.Regexp.Regexp == nil || s.Regexp.Regexp.String() == "" {
 		return errors.New("regexp must be set for HTTP header matchers")
 	}
 
 	return nil
+}
+
+// isCompressionAcceptEncodingValid validates the compression +
+// Accept-Encoding combination.
+//
+// If there's a compression setting, and there's also an accept-encoding
+// header, they MUST match, otherwise we end up requesting something
+// that doesn't include the specified compression, and that's likely to
+// fail, depending on how the server is configured. Testing that the
+// server _ignores_ Accept-Encoding, e.g. by not including a particular
+// compression in the header but expecting it in the response falls out
+// of the scope of the tests we perform.
+//
+// With that logic, this function validates that if a compression
+// algorithm is specified, it's covered by the specified accept encoding
+// header. It doesn't need to be the most prefered encoding, but it MUST
+// be included in the prefered encodings.
+func isCompressionAcceptEncodingValid(encoding, acceptEncoding string) bool {
+	// unspecified compression + any encoding value is valid
+	// any compression + no accept encoding is valid
+	if encoding == "" || acceptEncoding == "" {
+		return true
+	}
+
+	type encodingQuality struct {
+		encoding string
+		quality  float32
+	}
+
+	var encodings []encodingQuality
+
+	for _, parts := range strings.Split(acceptEncoding, ",") {
+		var e encodingQuality
+
+		if idx := strings.LastIndexByte(parts, ';'); idx == -1 {
+			e.encoding = strings.TrimSpace(parts)
+			e.quality = 1.0
+		} else {
+			parseQuality := func(str string) float32 {
+				q, err := strconv.ParseFloat(str, 32)
+				if err != nil {
+					return 0
+				}
+				return float32(math.Round(q*1000) / 1000)
+			}
+
+			e.encoding = strings.TrimSpace(parts[:idx])
+
+			q := strings.TrimSpace(parts[idx+1:])
+			q = strings.TrimPrefix(q, "q=")
+			e.quality = parseQuality(q)
+		}
+
+		encodings = append(encodings, e)
+	}
+
+	sort.SliceStable(encodings, func(i, j int) bool {
+		return encodings[j].quality < encodings[i].quality
+	})
+
+	for _, e := range encodings {
+		if encoding == e.encoding || e.encoding == "*" {
+			return e.quality > 0
+		}
+	}
+
+	return false
 }
